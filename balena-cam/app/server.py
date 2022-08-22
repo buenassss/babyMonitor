@@ -3,7 +3,13 @@ from time import sleep
 from aiohttp import web
 from av import VideoFrame
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack, RTCIceServer, RTCConfiguration
+from aiortc import MediaStreamTrack
+from aiortc.codecs import PCMU_CODEC
+from aiortc.exceptions import InvalidStateError
+from aiortc.mediastreams import AudioStreamTrack, VideoStreamTrack
 from aiohttp_basicauth import BasicAuthMiddleware
+
+import pyaudio
 
 class CameraDevice():
     def __init__(self):
@@ -85,6 +91,36 @@ class RTCVideoStream(VideoStreamTrack):
         frame.time_base = time_base
         return frame
 
+class RTCAudioStream(AudioStreamTrack):
+    def __init__(self) -> None:
+        super().__init__()
+
+        chunk = 1024  # Record in chunks of 1024 samples
+        sample_format = pyaudio.paInt16  # 16 bits per sample
+        channels = 1
+        fs = 44100  # Record at 44100 samples per second
+        seconds = 1
+
+        p = pyaudio.PyAudio()  # Create an interface to PortAudio
+
+        audioStream = p.open(format=sample_format,
+                        channels=channels,
+                        rate=fs,
+                        frames_per_buffer=chunk,
+                        input=True)
+
+        print ("Audio device is ready")
+
+    async def recv(self):
+        frames = []  # Initialize array to store frames
+
+        # Store data in chunks for X seconds
+        for i in range(0, int(self.fs / self.chunk * self.seconds)):
+            data = self.audioStream.read(self.chunk, exception_on_overflow = False)
+            frames.append(data)
+        return frames
+ 
+
 async def index(request):
     content = open(os.path.join(ROOT, 'client/index.html'), 'r').read()
     return web.Response(content_type='text/html', text=content)
@@ -115,17 +151,33 @@ async def offer(request):
         type=params['type'])
     pc = pc_factory.create_peer_connection()
     pcs.add(pc)
-    # Add local media
-    local_video = RTCVideoStream(camera_device)
-    pc.addTrack(local_video)
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange():
+        print("Connection state is %s" % pc.connectionState)
+        if pc.connectionState == "failed":
+            await pc.close()
+            pcs.discard(pc)
+
+    # open media source
+    # Add video
+    #local_video = RTCVideoStream(camera_device)
+    #video_sender = pc.addTrack(local_video)
+
+    local_audio = RTCAudioStream()
+    audio_sender = pc.addTrack(local_audio)
+
     @pc.on('iceconnectionstatechange')
     async def on_iceconnectionstatechange():
         if pc.iceConnectionState == 'failed':
             await pc.close()
             pcs.discard(pc)
+
     await pc.setRemoteDescription(offer)
+
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
+
     return web.Response(
         content_type='application/json',
         text=json.dumps({
@@ -153,6 +205,27 @@ async def mjpeg_handler(request):
         await response.write(b"\r\n")
     return response
 
+async def audio_video_handler(request):
+
+    boundary = "frame"
+    response = web.StreamResponse(status=200, reason='OK', headers={
+        'Content-Type': 'multipart/x-mixed-replace; '
+                        'boundary=%s' % boundary,
+    })
+    await response.prepare(request)
+    while True:
+        data = await camera_device.get_jpeg_frame()
+        await asyncio.sleep(0.2) # this means that the maximum FPS is 5
+        await response.write(
+            '--{}\r\n'.format(boundary).encode('utf-8'))
+        await response.write(b'Content-Type: video/mpeg\r\n')
+        await response.write('Content-Length: {}\r\n'.format(
+                len(data)).encode('utf-8'))
+        await response.write(b"\r\n")
+        await response.write(data)
+        await response.write(b"\r\n")
+    return response
+
 async def config(request):
     return web.Response(
         content_type='application/json',
@@ -163,6 +236,7 @@ async def on_shutdown(app):
     # close peer connections
     coros = [pc.close() for pc in pcs]
     await asyncio.gather(*coros)
+    pcs.clear()
 
 def checkDeviceReadiness():
     if not os.path.exists('/dev/video0') and platform.system() == 'Linux':
@@ -174,8 +248,28 @@ def checkDeviceReadiness():
     else:
         print('Video device is ready')
 
+def checkAudioInputDevice():
+
+    chunk = 1024  # Record in chunks of 1024 samples
+    sample_format = pyaudio.paInt16  # 16 bits per sample
+    channels = 1
+    fs = 44100  # Record at 44100 samples per second
+    seconds = 3
+
+    p = pyaudio.PyAudio()  # Create an interface to PortAudio
+
+    stream = p.open(format=sample_format,
+                    channels=channels,
+                    rate=fs,
+                    frames_per_buffer=chunk,
+                    input=True)
+
+    print ("Audio device is ready")
+
 if __name__ == '__main__':
     checkDeviceReadiness()
+
+    #checkAudioInputDevice()
 
     ROOT = os.path.dirname(__file__)
     pcs = set()
@@ -215,6 +309,6 @@ if __name__ == '__main__':
     app.router.add_get('/client.js', javascript)
     app.router.add_get('/style.css', stylesheet)
     app.router.add_post('/offer', offer)
-    app.router.add_get('/mjpeg', mjpeg_handler)
+    app.router.add_get('/mjpeg', audio_video_handler)
     app.router.add_get('/ice-config', config)
     web.run_app(app, port=80)
